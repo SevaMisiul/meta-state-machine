@@ -4,23 +4,226 @@
 
 #pragma once
 
-#include "utils.hpp"
-#include "variant.hpp"
-#include "front_interface.hpp"
+#include <stdlib.h>
+#include <type_traits>
+#include <utility>
+
+namespace msm {
+namespace detail {
+
+template<typename... Args>
+struct TypeSet {
+    static constexpr size_t size = sizeof...(Args);
+};
+
+template<typename Set, typename T>
+struct contains;
+
+template<typename U, typename... Args, typename T>
+struct contains<TypeSet<U, Args...>, T> {
+    static constexpr bool value = contains<TypeSet<Args...>, T>::value;
+};
+
+template<typename... Args, typename T>
+struct contains<TypeSet<T, Args...>, T> {
+    static constexpr bool value = true;
+};
+
+template<typename T>
+struct contains<TypeSet<>, T> {
+    static constexpr bool value = false;
+};
+
+template<typename Set, typename T>
+struct prepend {
+};
+
+template<typename... args, typename a>
+struct prepend<TypeSet<args...>, a> {
+    using type = TypeSet<a, args...>;
+};
+
+template<typename Set, typename T>
+struct filter {
+    using type = TypeSet<>;
+};
+
+template<typename... Args, typename T>
+struct filter<TypeSet<T, Args...>, T> {
+    using type = typename filter<TypeSet<Args...>, T>::type;
+};
+
+template<typename U, typename... Args, typename T>
+struct filter<TypeSet<U, Args...>, T> {
+    using type = typename prepend<typename filter<TypeSet<Args...>, T>::type, U>::type;
+};
+
+template <typename Set, typename T>
+struct get_index_internal;
+
+template <typename U, typename... Rest, typename T>
+struct get_index_internal<TypeSet<U, Rest...>, T> {
+    static constexpr size_t value = get_index_internal<TypeSet<Rest...>, T>::value;
+};
+
+template <typename... Rest, typename T>
+struct get_index_internal<TypeSet<T, Rest...>, T> {
+    static constexpr size_t value = sizeof...(Rest);
+};
+
+template <typename T>
+struct get_index_internal<TypeSet<>, T> {
+    static constexpr size_t value = -1;
+};
+
+template<typename Set, typename T>
+struct get_index {
+    static constexpr size_t value = Set::size - get_index_internal<Set, T>::value - 1;
+};
+
+} // namespace detail
+} // namespace msm
+
+namespace msm {
+namespace detail {
+
+struct InvalidTransition {};
+
+template<typename StateMachine, typename Row, typename = void>
+struct TransitionExecutorInternal {
+    explicit TransitionExecutorInternal(StateMachine & stateMachine)
+        : m_sm(stateMachine) {}
+
+    void operator()() {
+        m_sm.template change_state<typename Row::dst_state_type>();
+        (m_sm.m_definition.*Row::action)();
+    }
+
+private:
+    StateMachine & m_sm;
+};
+
+template<typename StateMachine, typename Row>
+struct TransitionExecutorInternal<StateMachine, Row,
+    typename std::enable_if<Row::action == nullptr>::type> {
+
+    explicit TransitionExecutorInternal(StateMachine & stateMachine)
+        : m_sm(stateMachine) {}
+
+    void operator()() {
+        m_sm.template change_state<typename Row::dst_state_type>();
+    }
+
+private:
+    StateMachine & m_sm;
+};
+
+template<typename StateMachine>
+struct TransitionExecutorInternal<StateMachine, InvalidTransition> {
+    explicit TransitionExecutorInternal(StateMachine & stateMachine) {}
+
+    void operator()() const {}
+};
+
+} // namespace detail
+} // namespace msm
+
+namespace msm {
+namespace detail {
+
+template<typename Visitor, typename Set>
+struct dispatcher;
+
+template<typename Visitor, typename... Args>
+struct dispatcher<Visitor, TypeSet<Args...>> {
+    using FuncPtr = void(*)(Visitor);
+
+    template<typename T>
+    static void call_visitor(Visitor v) {
+        v.template operator()<T>();
+    }
+
+    static void execute(size_t index, Visitor v) {
+        static constexpr FuncPtr jump_table[] = { &call_visitor<Args>... };
+
+        if (index < sizeof...(Args)) {
+            jump_table[index](v);
+        }
+    }
+};
+
+template<typename Array>
+struct Variant {};
+
+template<typename ...Args>
+struct Variant<TypeSet<Args...>> {
+    using set = TypeSet<Args...>;
+
+    template<typename InitialType>
+    explicit constexpr Variant(InitialType init) : m_curr_id{get_index<set, InitialType>::value} {}
+
+    explicit constexpr Variant(int id) : m_curr_id{id} {}
+
+    template<typename T>
+    void emplace() {
+        m_curr_id = get_index<set, T>::value;
+    }
+
+    template<typename Visitor>
+    void visit(Visitor&& visitor) const {
+        detail::dispatcher<Visitor, set>::execute(m_curr_id, std::forward<Visitor>(visitor));
+    }
+
+    int index() const {
+        return m_curr_id;
+    }
+
+private:
+    int m_curr_id = -1;
+};
+
+} // namespace detail
+} // namespace msm
 
 namespace msm {
 
-namespace detail {
+template<typename This>
+class FrontInterface {
+public:
+    using sm_action_type = void (This::*)();
 
-template<typename StateMachine, typename Row, typename T>
-struct TransitionExecutorInternal;
+    template<typename SrcState, typename Event, typename DstState, sm_action_type Action>
+    struct Row {
+        using src_state_type = SrcState;
+        using event_type = Event;
+        using dst_state_type = DstState;
+        static constexpr auto action = Action;
+    };
 
-template<typename T>
-void print_debug() {
-    std::cout << __PRETTY_FUNCTION__ << std::endl;
-}
+private:
+    template<typename... Rows>
+    struct StateSet {
+        using type = detail::TypeSet<>;
+    };
 
-} // namespace detail
+    template<typename SrcState, typename Event, typename DstState, sm_action_type Action, typename... Rows>
+    struct StateSet<Row<SrcState, Event, DstState, Action>, Rows...> {
+        using type = typename detail::prepend<
+            typename detail::filter<typename StateSet<Rows...>::type, SrcState>::type,
+            SrcState
+        >::type;
+    };
+
+public:
+    template<typename ...Rows>
+    struct TransitionTable {
+        using state_set = typename StateSet<Rows...>::type;
+    };
+};
+
+} // namespace msm
+
+namespace msm {
 
 template<typename SMDefinition>
 class StateMachine {
